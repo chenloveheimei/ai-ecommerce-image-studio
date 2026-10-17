@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 from io import BytesIO
 from pathlib import Path
 from uuid import uuid4
@@ -18,6 +20,7 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 
 APP_ROOT = Path(__file__).resolve().parent.parent
 RUNTIME = APP_ROOT / "runtime"
+EXPORT_SETTINGS = RUNTIME / "export-settings.json"
 UPLOADS = RUNTIME / "uploads"
 CUTOUTS = RUNTIME / "cutouts"
 BACKGROUNDS = RUNTIME / "backgrounds"
@@ -80,6 +83,24 @@ def model_settings() -> dict[str, str]:
 
 def save_model_settings(settings: dict[str, str]) -> None:
     MODEL_SETTINGS.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def export_directory() -> Path | None:
+    try:
+        raw = json.loads(EXPORT_SETTINGS.read_text(encoding="utf-8"))
+        path = Path(raw.get("directory", ""))
+        return path if path.is_dir() else None
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def save_export_directory(path: Path) -> None:
+    EXPORT_SETTINGS.write_text(json.dumps({"directory": str(path)}, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def safe_export_name(value: str, fallback: str) -> str:
+    cleaned = "".join("_" if char in '\\/:*?\"<>|' else char for char in value).strip().replace(" ", "_")
+    return (cleaned[:80] or fallback).strip("._") or fallback
 
 
 def cached_models() -> list[dict[str, object]]:
@@ -164,6 +185,81 @@ def health() -> dict[str, object]:
         "available_providers": ort.get_available_providers(),
         "loaded_models": [f"{name}:{device}" for name, device in _sessions],
     }
+
+
+@app.get("/api/export-directory")
+def get_export_directory() -> dict[str, object]:
+    directory = export_directory()
+    return {"configured": directory is not None, "path": str(directory) if directory else None}
+
+
+@app.post("/api/export-directory/select")
+def select_export_directory() -> dict[str, object]:
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        selected = filedialog.askdirectory(title="选择主图结果保存目录", mustexist=True)
+        root.destroy()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"无法打开 Windows 目录选择窗口：{exc}") from exc
+    if not selected:
+        return {"configured": False, "cancelled": True}
+    directory = Path(selected).resolve()
+    save_export_directory(directory)
+    return {"configured": True, "path": str(directory)}
+
+
+@app.post("/api/export-result")
+async def export_result(
+    image: UploadFile = File(...),
+    manifest: str = Form(...),
+    product_name: str = Form("product"),
+    folder_name: str = Form(""),
+) -> dict[str, object]:
+    directory = export_directory()
+    if directory is None:
+        raise HTTPException(status_code=400, detail="请先在输入链接页面设置默认导出目录。")
+    raw = await image.read()
+    if not raw or len(raw) > 30 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="导出图片为空或超过 30MB 限制。")
+    try:
+        with Image.open(BytesIO(raw)) as opened:
+            if opened.size != (800, 800):
+                raise ValueError("不是 800×800 图片")
+            output_image = BytesIO()
+            opened.convert("RGBA").save(output_image, format="PNG", optimize=True)
+    except (UnidentifiedImageError, OSError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=f"无法保存导出图片：{exc}") from exc
+    try:
+        manifest_data = json.loads(manifest)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="导出任务记录格式无效。") from exc
+    product = safe_export_name(product_name, "product")
+    folder = safe_export_name(folder_name, "export")
+    target = (directory / folder).resolve()
+    if directory not in target.parents:
+        raise HTTPException(status_code=400, detail="导出目录名称无效。")
+    target.mkdir(parents=True, exist_ok=True)
+    image_path = target / f"{product}_800x800.png"
+    image_path.write_bytes(output_image.getvalue())
+    (target / "manifest.json").write_text(json.dumps(manifest_data, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {"ok": True, "folder_path": str(target), "image_path": str(image_path)}
+
+
+@app.post("/api/open-export-directory")
+def open_export_directory() -> dict[str, object]:
+    directory = export_directory()
+    if directory is None:
+        raise HTTPException(status_code=400, detail="请先在输入链接页面设置默认导出目录。")
+    try:
+        os.startfile(str(directory))
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"无法打开文件夹：{exc}") from exc
+    return {"ok": True, "path": str(directory)}
 
 
 @app.get("/api/models")
